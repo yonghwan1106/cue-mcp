@@ -13,6 +13,8 @@ import sys
 import json
 from typing import Any
 
+from PIL import Image
+
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent, ImageContent
 
@@ -40,12 +42,15 @@ platform = WindowsPlatform()
 
 
 @mcp.tool()
-def screenshot(monitor: str = "primary") -> list[TextContent | ImageContent]:
+def screenshot(monitor: str = "primary", max_width: int = 1280,
+               quality: int = 60) -> list[TextContent | ImageContent]:
     """현재 화면을 캡처합니다.
 
     Args:
         monitor: 캡처 대상. 'primary'=주 모니터, 'all'=전체 가상 화면,
                  '0','1'=특정 모니터 인덱스
+        max_width: 전송용 이미지 최대 너비 (기본 1280). 원본은 파일로 저장됨.
+        quality: JPEG 압축 품질 1-95 (기본 60)
     """
     try:
         mon = int(monitor) if monitor.isdigit() else monitor
@@ -53,25 +58,40 @@ def screenshot(monitor: str = "primary") -> list[TextContent | ImageContent]:
         mon = "primary"
 
     img = platform.capture_screen(monitor=mon)
+    original_size = f"{img.width}x{img.height}"
 
+    # Save full-resolution original as fallback
+    fallback_buf = io.BytesIO()
+    img.save(fallback_buf, format="PNG")
+    fallback_path = _save_screenshot_fallback(fallback_buf.getvalue())
+
+    # Resize for MCP transport (keep aspect ratio)
+    if img.width > max_width:
+        ratio = max_width / img.width
+        new_h = int(img.height * ratio)
+        img = img.resize((max_width, new_h), Image.LANCZOS)
+
+    # JPEG compression for smaller payload
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    # Save fallback file for clients that can't render ImageContent
-    fallback_path = _save_screenshot_fallback(buf.getvalue())
-
     return [
-        ImageContent(type="image", data=b64, mimeType="image/png"),
+        ImageContent(type="image", data=b64, mimeType="image/jpeg"),
         TextContent(
             type="text",
-            text=f"스크린샷 캡처 완료: {img.width}x{img.height} (파일: {fallback_path})",
+            text=(
+                f"스크린샷 캡처 완료: 원본 {original_size}, "
+                f"전송 {img.width}x{img.height} "
+                f"(원본 파일: {fallback_path})"
+            ),
         ),
     ]
 
 
 @mcp.tool()
-def screenshot_region(x: int, y: int, width: int, height: int) -> list[TextContent | ImageContent]:
+def screenshot_region(x: int, y: int, width: int, height: int,
+                      quality: int = 70) -> list[TextContent | ImageContent]:
     """화면의 특정 영역을 캡처합니다.
 
     Args:
@@ -79,21 +99,26 @@ def screenshot_region(x: int, y: int, width: int, height: int) -> list[TextConte
         y: 시작 Y 좌표
         width: 캡처 너비
         height: 캡처 높이
+        quality: JPEG 압축 품질 1-95 (기본 70)
     """
     img = platform.capture_screen(monitor="all")
     region = img.crop((x, y, x + width, y + height))
 
+    # Save original
+    fallback_buf = io.BytesIO()
+    region.save(fallback_buf, format="PNG")
+    fallback_path = _save_screenshot_fallback(fallback_buf.getvalue())
+
+    # Compress for MCP transport
     buf = io.BytesIO()
-    region.save(buf, format="PNG", optimize=True)
+    region.save(buf, format="JPEG", quality=quality, optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    fallback_path = _save_screenshot_fallback(buf.getvalue())
-
     return [
-        ImageContent(type="image", data=b64, mimeType="image/png"),
+        ImageContent(type="image", data=b64, mimeType="image/jpeg"),
         TextContent(
             type="text",
-            text=f"영역 캡처 완료: ({x},{y}) {width}x{height} (파일: {fallback_path})",
+            text=f"영역 캡처 완료: ({x},{y}) {width}x{height} (원본: {fallback_path})",
         ),
     ]
 

@@ -24,6 +24,8 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO,
 logger = logging.getLogger("cue-mcp")
 
 from cue_mcp.platform import WindowsPlatform
+from cue_mcp.safety import SafetyGate
+from cue_mcp.memory import MemoryStore
 
 # ─── Server init ───────────────────────────────────────────
 
@@ -37,20 +39,22 @@ mcp = FastMCP(
 )
 
 platform = WindowsPlatform()
+safety_gate = SafetyGate()
+memory_store = MemoryStore()
 
 # ─── Screenshot tools ──────────────────────────────────────
 
 
 @mcp.tool()
-def screenshot(monitor: str = "primary", max_width: int = 1280,
-               quality: int = 60) -> list[TextContent | ImageContent]:
+def screenshot(monitor: str = "primary", max_width: int = 800,
+               quality: int = 40) -> list[TextContent | ImageContent]:
     """현재 화면을 캡처합니다.
 
     Args:
         monitor: 캡처 대상. 'primary'=주 모니터, 'all'=전체 가상 화면,
                  '0','1'=특정 모니터 인덱스
-        max_width: 전송용 이미지 최대 너비 (기본 1280). 원본은 파일로 저장됨.
-        quality: JPEG 압축 품질 1-95 (기본 60)
+        max_width: 전송용 이미지 최대 너비 (기본 800). 원본은 파일로 저장됨.
+        quality: JPEG 압축 품질 1-95 (기본 40)
     """
     try:
         mon = int(monitor) if monitor.isdigit() else monitor
@@ -336,6 +340,254 @@ def get_cursor_position() -> str:
     """현재 마우스 커서 위치를 반환합니다."""
     x, y = platform.get_cursor_position()
     return f"커서 위치: ({x}, {y})"
+
+
+# ─── Grounding tools (Phase 2) ─────────────────────────────
+
+
+@mcp.tool()
+def find_elements(label: str = "", max_results: int = 10) -> str:
+    """화면에서 UI 요소들을 감지합니다 (OpenCV + OCR).
+
+    그라운딩 결과로 버튼, 텍스트 필드, 아이콘 등의 좌표와 신뢰도를 반환합니다.
+
+    Args:
+        label: 찾고자 하는 UI 요소의 텍스트 (빈 문자열이면 모든 요소 반환)
+        max_results: 최대 반환 개수 (기본 10)
+    """
+    try:
+        from cue_mcp.grounding import GroundingEngine
+    except ImportError:
+        return "그라운딩 모듈 로드 실패: opencv-python, pytesseract 설치 필요"
+
+    engine = GroundingEngine()
+    img = platform.capture_screen(monitor="primary")
+    elements = engine.ground(img)
+
+    if label:
+        elements = engine.find_by_label(elements, label)
+
+    elements = elements[:max_results]
+
+    if not elements:
+        msg = f"'{label}' 요소를 찾을 수 없습니다." if label else "UI 요소를 감지하지 못했습니다."
+        return msg
+
+    lines = [f"감지된 UI 요소 {len(elements)}개:"]
+    for i, e in enumerate(elements):
+        cx, cy = e.center
+        lines.append(
+            f"  [{i}] {e.type}: '{e.label}' "
+            f"중심=({cx},{cy}) bbox={list(e.bbox)} "
+            f"신뢰도={e.confidence:.0%} 소스={e.sources}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def smart_click(label: str, button: str = "left") -> str:
+    """텍스트 레이블로 UI 요소를 찾아 자동으로 클릭합니다.
+
+    그라운딩으로 요소를 찾고 → 중심 좌표를 계산하고 → 클릭합니다.
+
+    Args:
+        label: 클릭할 UI 요소의 텍스트 (예: '로그인', 'Submit', '파일')
+        button: 마우스 버튼 ('left', 'right', 'middle')
+    """
+    try:
+        from cue_mcp.grounding import GroundingEngine
+    except ImportError:
+        return "그라운딩 모듈 로드 실패: opencv-python, pytesseract 설치 필요"
+
+    engine = GroundingEngine()
+    img = platform.capture_screen(monitor="primary")
+    elements = engine.ground(img)
+    matches = engine.find_by_label(elements, label)
+
+    if not matches:
+        return f"'{label}' 요소를 찾을 수 없습니다. screenshot으로 화면을 확인해주세요."
+
+    best = matches[0]
+    cx, cy = best.center
+
+    # Safety check
+    decision = safety_gate.check("click", label)
+    if decision.level.value == "blocked":
+        return f"안전 차단: {decision.reason}"
+
+    platform.click(cx, cy, button=button)
+    return (
+        f"스마트 클릭 완료: '{best.label}' ({best.type}) "
+        f"좌표=({cx},{cy}) 신뢰도={best.confidence:.0%}"
+    )
+
+
+# ─── Verification tools (Phase 2) ─────────────────────────
+
+
+@mcp.tool()
+def verify_action(
+    before_screenshot_path: str,
+    after_screenshot_path: str,
+    action_type: str = "click",
+    click_x: int = -1,
+    click_y: int = -1,
+) -> str:
+    """두 스크린샷을 비교하여 액션이 효과가 있었는지 검증합니다.
+
+    스크린샷 파일 경로를 받아 SSIM diff + 영역 분석으로 판정합니다.
+
+    Args:
+        before_screenshot_path: 액션 전 스크린샷 파일 경로
+        after_screenshot_path: 액션 후 스크린샷 파일 경로
+        action_type: 수행한 액션 종류 (click, type, scroll 등)
+        click_x: 클릭 X 좌표 (-1이면 미지정)
+        click_y: 클릭 Y 좌표 (-1이면 미지정)
+    """
+    from cue_mcp.verification import verify_screenshots
+
+    cx = click_x if click_x >= 0 else None
+    cy = click_y if click_y >= 0 else None
+
+    result = verify_screenshots(
+        before_screenshot_path, after_screenshot_path,
+        action_type=action_type, click_x=cx, click_y=cy,
+    )
+
+    status = "성공" if result.success else "실패"
+    return (
+        f"검증 결과: {status} (Tier {result.tier})\n"
+        f"신뢰도: {result.confidence:.0%}\n"
+        f"사유: {result.reason}\n"
+        f"상세: {json.dumps(result.details or {}, ensure_ascii=False)}"
+    )
+
+
+# ─── Safety tools (Phase 2) ───────────────────────────────
+
+
+@mcp.tool()
+def check_safety(action_type: str, text: str = "", key: str = "") -> str:
+    """액션의 안전성을 검사합니다 (SAFE/NEEDS_CONFIRMATION/BLOCKED).
+
+    위험한 명령어 패턴, 민감한 경로 접근, 반복 액션 등을 검사합니다.
+
+    Args:
+        action_type: 액션 종류 (click, type, key 등)
+        text: 입력 텍스트 (있는 경우)
+        key: 키 입력 (있는 경우)
+    """
+    decision = safety_gate.check(action_type, text, key)
+    return (
+        f"안전성: {decision.level.value}\n"
+        f"사유: {decision.reason}"
+        + (f"\n매칭 패턴: {decision.pattern_matched}" if decision.pattern_matched else "")
+    )
+
+
+# ─── Memory tools (Phase 2) ───────────────────────────────
+
+
+@mcp.tool()
+def recall_lessons(app: str = "", top_k: int = 5) -> str:
+    """학습된 교훈(Lesson)을 조회합니다.
+
+    과거 경험에서 추출된 '실패→성공' 패턴을 반환합니다.
+
+    Args:
+        app: 앱 이름 (빈 문자열이면 모든 앱의 교훈 반환)
+        top_k: 최대 반환 개수
+    """
+    if app:
+        lessons = memory_store.recall_lessons(app, top_k)
+    else:
+        lessons = memory_store.recall_all_lessons(top_k)
+
+    if not lessons:
+        return "저장된 교훈이 없습니다."
+
+    lines = [f"교훈 {len(lessons)}개:"]
+    for i, l in enumerate(lessons):
+        lines.append(
+            f"  [{i}] [{l.app}] {l.situation}\n"
+            f"      실패: '{l.failed_approach}'\n"
+            f"      성공: '{l.successful_approach}'\n"
+            f"      신뢰도: {l.confidence:.0%} (강화 {l.reinforcement_count}회)"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def save_lesson(
+    app: str, situation: str,
+    failed_approach: str, successful_approach: str,
+    confidence: float = 0.7,
+) -> str:
+    """새로운 교훈을 저장합니다.
+
+    실패한 접근법과 성공한 접근법을 기록하여 향후 참조합니다.
+
+    Args:
+        app: 앱 이름 (예: 'Chrome', 'VSCode', 'Excel')
+        situation: 상황 설명 (예: '로그인 폼에서 비밀번호 입력')
+        failed_approach: 실패한 접근법
+        successful_approach: 성공한 접근법
+        confidence: 신뢰도 0.0~1.0 (기본 0.7)
+    """
+    lesson_id = memory_store.save_lesson(
+        app=app, situation=situation,
+        failed_approach=failed_approach,
+        successful_approach=successful_approach,
+        confidence=confidence,
+    )
+    return f"교훈 저장 완료: {lesson_id}"
+
+
+@mcp.tool()
+def store_episode(
+    task: str, app: str, success: bool,
+    total_steps: int = 0, reflection: str = "",
+) -> str:
+    """작업 에피소드를 저장합니다.
+
+    완료된 작업의 결과를 기록하여 유사 작업 수행 시 참조합니다.
+
+    Args:
+        task: 수행한 작업 설명
+        app: 앱 이름
+        success: 성공 여부
+        total_steps: 총 단계 수
+        reflection: 회고/메모
+    """
+    episode_id = memory_store.store_episode(
+        task=task, app=app, success=success,
+        total_steps=total_steps, reflection=reflection,
+    )
+    return f"에피소드 저장 완료: {episode_id}"
+
+
+@mcp.tool()
+def recall_episodes(task: str, app: str, top_k: int = 3) -> str:
+    """유사한 과거 에피소드를 조회합니다.
+
+    Args:
+        task: 현재 작업 설명
+        app: 앱 이름
+        top_k: 최대 반환 개수
+    """
+    episodes = memory_store.find_similar_episodes(task, app, top_k)
+
+    if not episodes:
+        return f"'{app}'에 대한 유사 에피소드가 없습니다."
+
+    lines = [f"유사 에피소드 {len(episodes)}개:"]
+    for i, ep in enumerate(episodes):
+        status = "성공" if ep.success else "실패"
+        lines.append(
+            f"  [{i}] [{status}] {ep.task}\n"
+            f"      단계: {ep.total_steps}, 회고: {ep.reflection[:100]}"
+        )
+    return "\n".join(lines)
 
 
 # ─── Helpers ───────────────────────────────────────────────

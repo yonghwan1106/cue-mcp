@@ -222,6 +222,9 @@ def type_text(text: str) -> str:
     Args:
         text: 입력할 텍스트
     """
+    decision = safety_gate.check("type", text)
+    if decision.level.value == "blocked":
+        return f"안전 차단: {decision.reason}"
     platform.type_text(text)
     display = text[:50] + "..." if len(text) > 50 else text
     return f"입력 완료: '{display}'"
@@ -234,6 +237,9 @@ def press_key(key: str) -> str:
     Args:
         key: 키 이름 또는 조합. 예: 'enter', 'ctrl+s', 'alt+f4', 'ctrl+shift+t'
     """
+    decision = safety_gate.check("key", "", key)
+    if decision.level.value == "blocked":
+        return f"안전 차단: {decision.reason}"
     platform.press_key(key)
     return f"키 입력: {key}"
 
@@ -245,6 +251,9 @@ def hotkey(keys: str) -> str:
     Args:
         keys: 키 조합. 예: 'ctrl+c', 'ctrl+v', 'alt+tab', 'win+d'
     """
+    decision = safety_gate.check("key", "", keys)
+    if decision.level.value == "blocked":
+        return f"안전 차단: {decision.reason}"
     platform.press_key(keys)
     return f"단축키 실행: {keys}"
 
@@ -633,9 +642,6 @@ def execute_steps(steps: str) -> str:
           {"action": "key",   "params": {"key": "enter"}}
         ]
     """
-    import time
-    import io
-    import base64
     from cue_mcp.verification import verify_screenshots
 
     # ── Parse input ───────────────────────────────────────
@@ -757,6 +763,16 @@ def _save_screenshot_fallback(png_bytes: bytes) -> str:
     import os
     fallback_dir = os.path.join(tempfile.gettempdir(), "cue-mcp")
     os.makedirs(fallback_dir, exist_ok=True)
+
+    # Cleanup: remove files older than 1 hour
+    try:
+        cutoff = time.time() - 3600
+        for f in os.listdir(fallback_dir):
+            fpath = os.path.join(fallback_dir, f)
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+    except OSError:
+        pass
 
     filename = f"screenshot_{int(time.time() * 1000)}.png"
     filepath = os.path.join(fallback_dir, filename)

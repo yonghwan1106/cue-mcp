@@ -193,10 +193,15 @@ class WindowsPlatform:
     def _capture_monitor_by_index(self, index: int) -> Image.Image:
         """Capture a specific monitor by index."""
         monitors = self.get_monitors()
-        if index < 0 or index >= len(monitors):
+        if index >= len(monitors):
             return self._capture_primary()
         m = monitors[index]
-        return self._bitblt_capture(m["x"], m["y"], m["width"], m["height"])
+        try:
+            return self._bitblt_capture(m["x"], m["y"], m["width"], m["height"])
+        except Exception:
+            from PIL import ImageGrab
+            bbox = (m["x"], m["y"], m["x"] + m["width"], m["y"] + m["height"])
+            return ImageGrab.grab(bbox=bbox)
 
     def _bitblt_capture(self, x: int, y: int, w: int, h: int) -> Image.Image:
         """Low-level GDI BitBlt screen capture."""

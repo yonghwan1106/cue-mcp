@@ -11,6 +11,7 @@ import io
 import logging
 import sys
 import json
+import time
 from typing import Any
 
 from PIL import Image
@@ -42,6 +43,10 @@ platform = WindowsPlatform()
 safety_gate = SafetyGate()
 memory_store = MemoryStore()
 
+# Screenshot cache: key -> (timestamp, Image)
+_screenshot_cache: dict[str, tuple[float, Image.Image]] = {}
+_CACHE_TTL = 0.5  # 500ms 캐시 유효시간
+
 # ─── Screenshot tools ──────────────────────────────────────
 
 
@@ -61,7 +66,18 @@ def screenshot(monitor: str = "primary", max_width: int = 800,
     except (ValueError, AttributeError):
         mon = "primary"
 
-    img = platform.capture_screen(monitor=mon)
+    cache_key = str(mon)
+    now = time.time()
+    cache_hit = False
+    if cache_key in _screenshot_cache:
+        cached_time, cached_img = _screenshot_cache[cache_key]
+        if now - cached_time < _CACHE_TTL:
+            img = cached_img.copy()
+            cache_hit = True
+    if not cache_hit:
+        img = platform.capture_screen(monitor=mon)
+        _screenshot_cache[cache_key] = (now, img.copy())
+
     original_size = f"{img.width}x{img.height}"
 
     # Save full-resolution original as fallback
@@ -80,12 +96,13 @@ def screenshot(monitor: str = "primary", max_width: int = 800,
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode()
 
+    cache_note = " (캐시)" if cache_hit else ""
     return [
         ImageContent(type="image", data=b64, mimeType="image/jpeg"),
         TextContent(
             type="text",
             text=(
-                f"스크린샷 캡처 완료: 원본 {original_size}, "
+                f"스크린샷 캡처 완료{cache_note}: 원본 {original_size}, "
                 f"전송 {img.width}x{img.height} "
                 f"(원본 파일: {fallback_path})"
             ),
@@ -590,6 +607,147 @@ def recall_episodes(task: str, app: str, top_k: int = 3) -> str:
     return "\n".join(lines)
 
 
+# ─── Multi-step execution tool ────────────────────────────
+
+
+@mcp.tool()
+def execute_steps(steps: str) -> str:
+    """여러 GUI 액션을 순차적으로 실행하며 각 단계마다 스크린샷으로 검증합니다.
+
+    Args:
+        steps: JSON 형식의 액션 리스트.
+               각 항목: {"action": "click|type|key|scroll|wait", "params": {...}}
+
+    액션별 params:
+        click:  {"x": int, "y": int, "button": str}
+        type:   {"text": str}
+        key:    {"key": str}
+        scroll: {"x": int, "y": int, "clicks": int, "direction": str}
+        wait:   {"seconds": float}
+
+    예시:
+        [
+          {"action": "click", "params": {"x": 100, "y": 200}},
+          {"action": "wait",  "params": {"seconds": 1}},
+          {"action": "type",  "params": {"text": "hello"}},
+          {"action": "key",   "params": {"key": "enter"}}
+        ]
+    """
+    import time
+    import io
+    import base64
+    from cue_mcp.verification import verify_screenshots
+
+    # ── Parse input ───────────────────────────────────────
+    try:
+        action_list = json.loads(steps)
+    except json.JSONDecodeError as e:
+        return f"JSON 파싱 오류: {e}"
+
+    if not isinstance(action_list, list):
+        return "steps는 JSON 배열이어야 합니다."
+
+    results = []
+    total = len(action_list)
+
+    for idx, step in enumerate(action_list):
+        action = step.get("action", "")
+        params = step.get("params", {})
+        step_label = f"[{idx + 1}/{total}] {action}"
+
+        if not action:
+            results.append(f"{step_label}: 'action' 필드가 없습니다. 건너뜁니다.")
+            continue
+
+        # ── Safety check ─────────────────────────────────
+        text_param = params.get("text", "")
+        key_param = params.get("key", "")
+        decision = safety_gate.check(action, text_param, key_param)
+        if decision.level.value == "blocked":
+            results.append(f"{step_label}: 안전 차단 — {decision.reason}")
+            results.append(f"총 {idx}/{total} 단계 완료 후 중단.")
+            return "\n".join(results)
+
+        # ── Before screenshot ─────────────────────────────
+        before_img = platform.capture_screen(monitor="primary")
+        before_buf = io.BytesIO()
+        before_img.save(before_buf, format="PNG")
+        before_path = _save_screenshot_fallback(before_buf.getvalue())
+
+        # ── Execute action ────────────────────────────────
+        try:
+            if action == "click":
+                x = params.get("x", 0)
+                y = params.get("y", 0)
+                button = params.get("button", "left")
+                platform.click(x, y, button=button)
+                action_desc = f"click ({x},{y}) [{button}]"
+
+            elif action == "type":
+                text = params.get("text", "")
+                platform.type_text(text)
+                display = text[:30] + "..." if len(text) > 30 else text
+                action_desc = f"type '{display}'"
+
+            elif action == "key":
+                key = params.get("key", "")
+                platform.press_key(key)
+                action_desc = f"key '{key}'"
+
+            elif action == "scroll":
+                x = params.get("x", 0)
+                y = params.get("y", 0)
+                clicks = params.get("clicks", 3)
+                direction = params.get("direction", "down")
+                platform.scroll(x, y, clicks=clicks, direction=direction)
+                action_desc = f"scroll ({x},{y}) {direction} {clicks}칸"
+
+            elif action == "wait":
+                seconds = float(params.get("seconds", 1))
+                time.sleep(seconds)
+                results.append(f"{step_label}: 대기 {seconds}초 완료")
+                continue  # No verification needed for wait
+
+            else:
+                results.append(f"{step_label}: 알 수 없는 액션 '{action}'. 건너뜁니다.")
+                continue
+
+        except Exception as e:
+            results.append(f"{step_label}: 실행 오류 — {e}")
+            results.append(f"총 {idx}/{total} 단계 완료 후 중단.")
+            return "\n".join(results)
+
+        # ── After screenshot ──────────────────────────────
+        after_img = platform.capture_screen(monitor="primary")
+        after_buf = io.BytesIO()
+        after_img.save(after_buf, format="PNG")
+        after_path = _save_screenshot_fallback(after_buf.getvalue())
+
+        # ── Verify ───────────────────────────────────────
+        click_x = params.get("x") if action == "click" else None
+        click_y = params.get("y") if action == "click" else None
+        vresult = verify_screenshots(
+            before_path, after_path,
+            action_type=action,
+            click_x=click_x,
+            click_y=click_y,
+        )
+
+        status = "성공" if vresult.success else "실패"
+        results.append(
+            f"{step_label}: {action_desc} → 검증 {status} "
+            f"(Tier {vresult.tier}, 신뢰도 {vresult.confidence:.0%}) — {vresult.reason}"
+        )
+
+        if not vresult.success and vresult.confidence >= 0.7:
+            results.append(f"검증 실패 (신뢰도 {vresult.confidence:.0%}) → 중단.")
+            results.append(f"총 {idx + 1}/{total} 단계 완료 후 중단.")
+            return "\n".join(results)
+
+    results.append(f"\n모든 {total}단계 완료.")
+    return "\n".join(results)
+
+
 # ─── Helpers ───────────────────────────────────────────────
 
 
@@ -600,8 +758,7 @@ def _save_screenshot_fallback(png_bytes: bytes) -> str:
     fallback_dir = os.path.join(tempfile.gettempdir(), "cue-mcp")
     os.makedirs(fallback_dir, exist_ok=True)
 
-    import time as _time
-    filename = f"screenshot_{int(_time.time() * 1000)}.png"
+    filename = f"screenshot_{int(time.time() * 1000)}.png"
     filepath = os.path.join(fallback_dir, filename)
 
     with open(filepath, "wb") as f:
